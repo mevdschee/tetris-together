@@ -11,6 +11,7 @@
 #include <stdio.h>        // defines: printf, snprintf, fprintf
 #include <stdlib.h>       // defines: malloc, rand, srand, atoi
 #include <string.h>       // defines: memset, memcpy, strcmp
+#include <strings.h>      // defines: strcasecmp
 #include <stdarg.h>       // defines: va_list
 #include <stdbool.h>      // defines: true, false
 #include <stdint.h>       // defines: uint8_t, uint32_t
@@ -28,6 +29,7 @@
 #include <arpa/inet.h>    // defines: inet_ntop
 #include <netdb.h>        // defines: getaddrinfo
 #include <ifaddrs.h>      // defines: getifaddrs
+#include <net/if.h>       // defines: IFF_UP, IFF_MULTICAST, IFF_LOOPBACK
 
 #define MAXP 100        // players in one game
 #define BW 10           // board width
@@ -41,6 +43,9 @@
 #define SAMPLE_MS 500.0 // graph sample interval
 #define KO_MS 5000.0    // a knocked out opponent stays on screen this long
 #define DEFAULT_PORT 9471
+#define MDNS_PORT 5353
+#define MDNS_GROUP "224.0.0.251"
+#define MDNS_SERVICE "_tetris-together._tcp.local"
 
 enum { KIND_NONE, KIND_HUMAN, KIND_BOT, KIND_REMOTE };
 enum { ST_LOBBY, ST_COUNTDOWN, ST_PLAYING, ST_OVER };
@@ -135,7 +140,11 @@ static struct
 static Player players[MAXP];
 static Conn conns[MAXP];
 static int view[MAXP][2]; // the ring neighbours each player has on screen
-static int listenFd = -1;
+static int listenFd = -1, mdnsFd = -1;
+static struct in_addr mdnsIfs[16]; // interfaces mDNS runs on
+static int mdnsIfN;
+static char mdnsInstance[96], mdnsTarget[64];
+static struct sockaddr_in mdnsGroup;
 static volatile sig_atomic_t running = 1, resized = 1;
 
 static int8_t shapes[8][4][4][2];
@@ -1603,6 +1612,305 @@ static int netJoin(const char *addr)
 }
 
 /* ------------------------------------------------------------------------ */
+/* local network discovery (mDNS / DNS-SD)                                  */
+/* ------------------------------------------------------------------------ */
+
+static int dnsPutName(uint8_t *d, int off, const char *name)
+{
+	while (*name)
+	{
+		const char *dot = strchr(name, '.');
+		int n = dot ? (int)(dot - name) : (int)strlen(name);
+		d[off++] = n;
+		memcpy(d + off, name, n);
+		off += n;
+		name += n + (dot != NULL);
+	}
+	d[off++] = 0;
+	return off;
+}
+
+// read a (compressed) name as a dotted string, returns the offset after it or -1
+static int dnsGetName(const uint8_t *d, int len, int off, char *out, int cap)
+{
+	int end = -1, o = 0, jumps = 0;
+	while (off < len)
+	{
+		int n = d[off];
+		if ((n & 0xC0) == 0xC0)
+		{
+			if (off + 1 >= len || ++jumps > 16)
+				return -1;
+			if (end < 0)
+				end = off + 2;
+			off = (n & 0x3F) << 8 | d[off + 1];
+			continue;
+		}
+		if (n == 0)
+		{
+			out[o] = 0;
+			return end < 0 ? off + 1 : end;
+		}
+		if (n > 63 || off + 1 + n > len || o + n + 2 > cap)
+			return -1;
+		if (o)
+			out[o++] = '.';
+		memcpy(out + o, d + off + 1, n);
+		o += n;
+		off += 1 + n;
+	}
+	return -1;
+}
+
+static int dnsPutRecord(uint8_t *d, int off, const char *name, int type, bool flush, uint32_t ttl, const uint8_t *rdata, int rlen)
+{
+	off = dnsPutName(d, off, name);
+	put16(d + off, type);
+	put16(d + off + 2, flush ? 0x8001 : 1);
+	put32(d + off + 4, ttl);
+	put16(d + off + 8, rlen);
+	memcpy(d + off + 10, rdata, rlen);
+	return off + 10 + rlen;
+}
+
+static int mdnsOpen(void)
+{
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -1;
+	// share the port with avahi and other mDNS responders
+	int one = 1;
+	unsigned char ttl = 255;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+	struct sockaddr_in a = {0};
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_ANY);
+	a.sin_port = htons(MDNS_PORT);
+	mdnsGroup = a;
+	mdnsGroup.sin_addr.s_addr = inet_addr(MDNS_GROUP);
+	if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0)
+	{
+		close(fd);
+		return -1;
+	}
+	// join the group on every interface, so games on any of them are found
+	struct ifaddrs *ifa, *i;
+	mdnsIfN = 0;
+	if (getifaddrs(&ifa) == 0)
+	{
+		for (i = ifa; i && mdnsIfN < 16; i = i->ifa_next)
+			if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET && (i->ifa_flags & IFF_UP) &&
+				(i->ifa_flags & IFF_MULTICAST) && !(i->ifa_flags & IFF_LOOPBACK))
+				mdnsIfs[mdnsIfN++] = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
+		freeifaddrs(ifa);
+	}
+	struct ip_mreq m;
+	m.imr_multiaddr.s_addr = inet_addr(MDNS_GROUP);
+	m.imr_interface.s_addr = htonl(INADDR_ANY);
+	if (!mdnsIfN)
+		setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof(m));
+	for (int k = 0; k < mdnsIfN; k++)
+	{
+		m.imr_interface = mdnsIfs[k];
+		setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof(m));
+	}
+	return fd;
+}
+
+// send to one address, or multicast on every interface when to is NULL
+static void mdnsSend(const uint8_t *d, int len, const struct sockaddr_in *to)
+{
+	if (to || !mdnsIfN)
+		sendto(mdnsFd, d, len, 0, (const struct sockaddr *)(to ? to : &mdnsGroup), sizeof(mdnsGroup));
+	else
+		for (int k = 0; k < mdnsIfN; k++)
+		{
+			setsockopt(mdnsFd, IPPROTO_IP, IP_MULTICAST_IF, &mdnsIfs[k], sizeof(mdnsIfs[k]));
+			sendto(mdnsFd, d, len, 0, (const struct sockaddr *)&mdnsGroup, sizeof(mdnsGroup));
+		}
+}
+
+// PTR, SRV, TXT and A records describing the hosted game, with the address
+// of interface iface only, or of all interfaces when iface is negative
+static int mdnsAnswer(uint8_t *d, int id, uint32_t ttl, int iface)
+{
+	uint8_t r[128];
+	int off = 12, n = 0, rl;
+	memset(d, 0, 12);
+	put16(d, id);
+	put16(d + 2, 0x8400);
+	rl = dnsPutName(r, 0, mdnsInstance);
+	off = dnsPutRecord(d, off, MDNS_SERVICE, 12, false, ttl, r, rl), n++;
+	memset(r, 0, 6);
+	put16(r + 4, G.port);
+	rl = dnsPutName(r, 6, mdnsTarget);
+	off = dnsPutRecord(d, off, mdnsInstance, 33, true, ttl, r, rl), n++;
+	rl = snprintf((char *)r + 1, sizeof(r) - 1, "v=%s", VERSION);
+	r[0] = rl;
+	off = dnsPutRecord(d, off, mdnsInstance, 16, true, ttl, r, rl + 1), n++;
+	for (int k = 0; k < mdnsIfN; k++)
+		if (iface < 0 || k == iface)
+			off = dnsPutRecord(d, off, mdnsTarget, 1, true, ttl, (const uint8_t *)&mdnsIfs[k], 4), n++;
+	put16(d + 6, n);
+	return off;
+}
+
+// describe the hosted game, ttl 0 says goodbye
+static void mdnsReply(int id, uint32_t ttl, const struct sockaddr_in *to)
+{
+	uint8_t d[1500];
+	if (to || !mdnsIfN)
+		mdnsSend(d, mdnsAnswer(d, id, ttl, -1), to);
+	else
+		for (int k = 0; k < mdnsIfN; k++)
+		{
+			setsockopt(mdnsFd, IPPROTO_IP, IP_MULTICAST_IF, &mdnsIfs[k], sizeof(mdnsIfs[k]));
+			mdnsSend(d, mdnsAnswer(d, id, ttl, k), &mdnsGroup);
+		}
+}
+
+static void mdnsHost(void)
+{
+	char hn[64] = "host", label[48];
+	gethostname(hn, sizeof(hn));
+	hn[sizeof(hn) - 1] = 0;
+	hn[strcspn(hn, ".")] = 0;
+	snprintf(label, sizeof(label), "%.15s@%.31s", players[0].name, hn);
+	for (char *c = label; *c; c++)
+		if (*c == '.')
+			*c = '-';
+	snprintf(mdnsInstance, sizeof(mdnsInstance), "%s.%s", label, MDNS_SERVICE);
+	snprintf(mdnsTarget, sizeof(mdnsTarget), "%.31s-tetris-%d.local", hn, G.port);
+	mdnsFd = mdnsOpen();
+	if (mdnsFd >= 0)
+		mdnsReply(0, 120, NULL);
+}
+
+// answer queries for our service
+static void mdnsRead(void)
+{
+	uint8_t d[1500];
+	char name[256];
+	struct sockaddr_in from;
+	socklen_t fl = sizeof(from);
+	int len = recvfrom(mdnsFd, d, sizeof(d), 0, (struct sockaddr *)&from, &fl);
+	if (len < 12 || (d[2] & 0x80))
+		return;
+	bool hit = false;
+	for (int q = 0, nq = get16(d + 4), off = 12; q < nq; q++, off += 4)
+	{
+		off = dnsGetName(d, len, off, name, sizeof(name));
+		if (off < 0 || off + 4 > len)
+			return;
+		int type = get16(d + off);
+		if ((type == 12 || type == 255) && !strcasecmp(name, MDNS_SERVICE))
+			hit = true;
+	}
+	if (!hit)
+		return;
+	// a query not sent from the mDNS port expects a direct (legacy) answer
+	bool legacy = ntohs(from.sin_port) != MDNS_PORT;
+	mdnsReply(legacy ? get16(d) : 0, 120, legacy ? &from : NULL);
+}
+
+// ask the local network for hosted games, fills name and "ip:port" pairs
+static int mdnsBrowse(char games[][2][80], int max)
+{
+	mdnsFd = mdnsOpen();
+	if (mdnsFd < 0)
+		return -1;
+	uint8_t q[64] = {0};
+	put16(q + 4, 1);
+	int ql = dnsPutName(q, 12, MDNS_SERVICE);
+	put16(q + ql, 12);
+	put16(q + ql + 2, 1);
+	ql += 4;
+	int n = 0;
+	double start = nowMs(), next = start;
+	while (nowMs() - start < 1500)
+	{
+		if (nowMs() >= next)
+		{
+			mdnsSend(q, ql, NULL);
+			next += 500;
+		}
+		struct pollfd pf = {mdnsFd, POLLIN, 0};
+		if (poll(&pf, 1, 50) <= 0)
+			continue;
+		uint8_t d[1500];
+		char name[256];
+		struct sockaddr_in from;
+		socklen_t fl = sizeof(from);
+		int len = recvfrom(mdnsFd, d, sizeof(d), 0, (struct sockaddr *)&from, &fl);
+		if (len < 12 || !(d[2] & 0x80))
+			continue;
+		int off = 12, nr = get16(d + 6) + get16(d + 8) + get16(d + 10);
+		for (int k = 0, nq = get16(d + 4); k < nq && off >= 0; k++)
+			if ((off = dnsGetName(d, len, off, name, sizeof(name))) >= 0)
+				off += 4;
+		// the SRV record has the port, the packet source is the address
+		for (int k = 0; k < nr && off >= 0; k++)
+		{
+			off = dnsGetName(d, len, off, name, sizeof(name));
+			if (off < 0 || off + 10 > len)
+				break;
+			int type = get16(d + off), rlen = get16(d + off + 8);
+			uint32_t ttl = get32(d + off + 4);
+			off += 10;
+			if (off + rlen > len)
+				break;
+			int sl = strlen(name), tl = strlen(MDNS_SERVICE);
+			if (type == 33 && ttl > 0 && rlen >= 6 && sl > tl + 1 && name[sl - tl - 1] == '.' && !strcasecmp(name + sl - tl, MDNS_SERVICE))
+			{
+				name[sl - tl - 1] = 0;
+				bool seen = false;
+				for (int g = 0; g < n; g++)
+					seen |= !strcmp(games[g][0], name);
+				if (!seen && n < max)
+				{
+					char ip[INET_ADDRSTRLEN];
+					inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+					snprintf(games[n][0], sizeof(games[n][0]), "%s", name);
+					snprintf(games[n][1], sizeof(games[n][1]), "%s:%d", ip, get16(d + off + 4));
+					n++;
+				}
+			}
+			off += rlen;
+		}
+	}
+	close(mdnsFd);
+	mdnsFd = -1;
+	return n;
+}
+
+// find a game on the local network, asks which one when there are several
+static const char *mdnsFindGame(void)
+{
+	static char games[16][2][80];
+	printf("searching the local network for games...\n");
+	int n = mdnsBrowse(games, 16);
+	if (n < 0)
+		fprintf(stderr, "tetris-together: cannot listen on udp port %d\n", MDNS_PORT);
+	else if (n == 0)
+		fprintf(stderr, "tetris-together: no games found, try --join HOST[:PORT]\n");
+	if (n <= 0)
+		return NULL;
+	if (n == 1)
+	{
+		printf("joining %s (%s)\n", games[0][0], games[0][1]);
+		return games[0][1];
+	}
+	for (int i = 0; i < n; i++)
+		printf("  %d) %s (%s)\n", i + 1, games[i][0], games[i][1]);
+	printf("join which game? ");
+	fflush(stdout);
+	char line[16];
+	int k = fgets(line, sizeof(line), stdin) ? atoi(line) : 0;
+	return k >= 1 && k <= n ? games[k - 1][1] : NULL;
+}
+
+/* ------------------------------------------------------------------------ */
 /* drawing                                                                  */
 /* ------------------------------------------------------------------------ */
 
@@ -1934,6 +2242,8 @@ static void render(void)
 			snprintf(addr, sizeof(addr), "%s:%d", G.hostAddr, G.port);
 			l[n] = "join with -j", lc[n++] = C_LABEL;
 			l[n] = addr, lc[n++] = gradNet[0];
+			if (mdnsFd >= 0)
+				l[n] = "(address optional)", lc[n++] = C_LABEL;
 		}
 		// show 8 players at a time, the arrow keys scroll the list
 		int maxScroll = nIn > 8 ? nIn - 8 : 0;
@@ -2151,7 +2461,7 @@ static void usage(void)
 	printf("  -b, --bots N           play against 1 or 2 bots\n");
 	printf("  -d, --difficulty D     bot difficulty: easy, normal, hard\n");
 	printf("  -s, --host [PORT]      host a game for up to %d players (default port %d)\n", MAXP, DEFAULT_PORT);
-	printf("  -j, --join HOST[:PORT] join a hosted game\n");
+	printf("  -j, --join [HOST[:PORT]] join a hosted game, finds one on the local network without HOST\n");
 	printf("  -l, --level N          start level (1-20)\n");
 	printf("      --256              use 256 colors instead of truecolor\n");
 	printf("  -h, --help             show this help\n");
@@ -2189,10 +2499,11 @@ int main(int argc, char *argv[])
 			if (more && argv[i + 1][0] != '-')
 				G.port = atoi(argv[++i]);
 		}
-		else if ((!strcmp(a, "-j") || !strcmp(a, "--join")) && more)
+		else if (!strcmp(a, "-j") || !strcmp(a, "--join"))
 		{
 			G.mode = MODE_CLIENT;
-			join = argv[++i];
+			if (more && argv[i + 1][0] != '-')
+				join = argv[++i];
 		}
 		else if ((!strcmp(a, "-l") || !strcmp(a, "--level")) && more)
 			G.startLevel = atoi(argv[++i]);
@@ -2241,6 +2552,10 @@ int main(int argc, char *argv[])
 
 	if (G.mode == MODE_HOST && netHost(G.port) < 0)
 		return EXIT_FAILURE;
+	if (G.mode == MODE_HOST)
+		mdnsHost();
+	if (G.mode == MODE_CLIENT && !join && !(join = mdnsFindGame()))
+		return EXIT_FAILURE;
 	if (G.mode == MODE_CLIENT)
 	{
 		char myName[16];
@@ -2264,14 +2579,19 @@ int main(int argc, char *argv[])
 	double last = nowMs(), lastSample = last, lastSend = 0, lastRender = 0;
 	while (running)
 	{
-		struct pollfd pf[2 + MAXP];
-		int map[2 + MAXP], n = 0;
+		struct pollfd pf[3 + MAXP];
+		int map[3 + MAXP], n = 0;
 		pf[n] = (struct pollfd){STDIN_FILENO, POLLIN, 0};
 		map[n++] = -2;
 		if (listenFd >= 0)
 		{
 			pf[n] = (struct pollfd){listenFd, POLLIN, 0};
 			map[n++] = -1;
+		}
+		if (mdnsFd >= 0)
+		{
+			pf[n] = (struct pollfd){mdnsFd, POLLIN, 0};
+			map[n++] = -3;
 		}
 		for (int i = 0; i < MAXP; i++)
 			if (conns[i].fd >= 0)
@@ -2288,6 +2608,8 @@ int main(int argc, char *argv[])
 					readInput();
 				else if (map[i] == -1)
 					acceptConn();
+				else if (map[i] == -3)
+					mdnsRead();
 				else if (conns[map[i]].fd >= 0)
 					readConn(map[i]);
 			}
@@ -2354,6 +2676,11 @@ int main(int argc, char *argv[])
 			close(conns[i].fd);
 	if (listenFd >= 0)
 		close(listenFd);
+	if (mdnsFd >= 0)
+	{
+		mdnsReply(0, 0, NULL);
+		close(mdnsFd);
+	}
 	if (G.status[0])
 		printf("%s\n", G.status);
 	return EXIT_SUCCESS;

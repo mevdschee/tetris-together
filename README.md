@@ -24,7 +24,14 @@ players the opponent is shown on both sides.
     ./tetris-together                     # marathon
     ./tetris-together --bots 2            # against two bots (easy, normal, hard via -d)
     ./tetris-together --host              # host a game for up to 100 players on port 9471
+    ./tetris-together --join              # join a game on the local network
     ./tetris-together --join 10.0.0.5     # join a hosted game (HOST[:PORT])
+
+Hosted games are announced on the local network with mDNS (DNS-SD service
+`_tetris-together._tcp`), so `--join` without an address finds them. When there
+are several you are asked which one to join. Discovery needs UDP port 5353, which
+most firewalls allow, the game itself still needs the TCP port of the host to be
+reachable.
 
 The host presses enter to start a round. All players get the same piece sequence.
 The players form a ring: cleared lines are sent as garbage to the player on your

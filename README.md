@@ -1,4 +1,4 @@
-# tetris-together
+# tetris-together.c
 
 Multiplayer console tetris for GNU/Linux in a single C file without dependencies,
 in the spirit of [2048.c](https://github.com/mevdschee/2048.c) and

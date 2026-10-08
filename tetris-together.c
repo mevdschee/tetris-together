@@ -29,7 +29,7 @@
 #include <netdb.h>        // defines: getaddrinfo
 #include <ifaddrs.h>      // defines: getifaddrs
 
-#define MAXP 3          // players in one game
+#define MAXP 100        // players in one game
 #define BW 10           // board width
 #define BH 22           // board height (20 visible + 2 hidden)
 #define HIDDEN 2        // hidden rows on top of the board
@@ -97,7 +97,7 @@ typedef struct
 	bool lastRotate;
 	int lastKick;
 	// stats
-	int pieces, attack, targetRR, samplePieces;
+	int pieces, attack, samplePieces;
 	double koTime;
 	double playTime;
 	float apm, pps, ppsNow;
@@ -126,7 +126,7 @@ typedef struct
 
 static struct
 {
-	int mode, state, myId, winner, nBots, startLevel, port;
+	int mode, state, myId, winner, nBots, startLevel, port, lobbyScroll;
 	double stateTime, botDelay, botNoise;
 	bool paused, trueColor;
 	char status[64], hostAddr[64];
@@ -134,6 +134,7 @@ static struct
 
 static Player players[MAXP];
 static Conn conns[MAXP];
+static int view[MAXP][2]; // the ring neighbours each player has on screen
 static int listenFd = -1;
 static volatile sig_atomic_t running = 1, resized = 1;
 
@@ -173,6 +174,7 @@ static const int8_t kickI[8][5][2] = {
 static const int8_t kick180[5][2] = {{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}};
 
 static void sendAttack(Player *p, int lines);
+static void relayState(int from, const uint8_t *d, int len);
 
 /* ------------------------------------------------------------------------ */
 /* utilities                                                                */
@@ -1215,7 +1217,7 @@ static void checkRoundOver(void)
 
 static void sendPacket(int fd, int type, int from, const uint8_t *d, int len)
 {
-	uint8_t pkt[4 + 512];
+	uint8_t pkt[4 + MAXP * 17];
 	put16(pkt, len);
 	pkt[2] = type;
 	pkt[3] = from;
@@ -1261,24 +1263,64 @@ static void sendState(void)
 	put16(d + 207, p->lines);
 	put16(d + 209, (int)(p->apm * 10));
 	put16(d + 211, (int)(p->pps * 100));
-	netSend(MSG_STATE, d, sizeof(d));
+	// a change of the alive flag goes to everyone, as it changes the ring
+	static int sentAlive = -1;
+	if (G.mode == MODE_HOST && p->alive == sentAlive)
+		relayState(G.myId, d, sizeof(d));
+	else
+		netSend(MSG_STATE, d, sizeof(d));
+	sentAlive = p->alive;
 }
 
-static int pickTarget(int from)
+// players form a ring: garbage comes from the left and goes to the right
+static int ringTarget(int from)
 {
-	int cand[MAXP], n = 0;
+	for (int k = 1; k < MAXP; k++)
+	{
+		int i = (from + k) % MAXP;
+		if (players[i].present && players[i].inRound && players[i].alive)
+			return i;
+	}
+	return -1;
+}
+
+// the neighbour shown on the left (side 0) or right (side 1), knocked out players
+// disappear after KO_MS unless nobody else is left
+static int ringView(int me, int side, double t)
+{
+	for (int pass = 0; pass < 2; pass++)
+		for (int k = 1; k < MAXP; k++)
+		{
+			int i = (me + (side ? k : MAXP - k)) % MAXP;
+			Player *p = &players[i];
+			bool gone = G.state != ST_LOBBY && p->inRound && !p->alive && t - p->koTime >= KO_MS;
+			if (p->present && (pass || !gone))
+				return i;
+		}
+	return -1;
+}
+
+static void updateViews(double t)
+{
 	for (int i = 0; i < MAXP; i++)
-		if (i != from && players[i].present && players[i].inRound && players[i].alive)
-			cand[n++] = i;
-	if (!n)
-		return -1;
-	return cand[players[from].targetRR++ % n];
+	{
+		view[i][0] = players[i].present ? ringView(i, 0, t) : -1;
+		view[i][1] = players[i].present ? ringView(i, 1, t) : -1;
+	}
+}
+
+// send a state only to the clients that have the sender on screen
+static void relayState(int from, const uint8_t *d, int len)
+{
+	for (int i = 1; i < MAXP; i++)
+		if (i != from && conns[i].fd >= 0 && (view[i][0] == from || view[i][1] == from))
+			sendPacket(conns[i].fd, MSG_STATE, from, d, len);
 }
 
 static void sendAttack(Player *p, int lines)
 {
 	int from = (int)(p - players);
-	int target = pickTarget(from);
+	int target = ringTarget(from);
 	if (target < 0)
 		return;
 	if (G.mode == MODE_OFFLINE)
@@ -1379,11 +1421,25 @@ static void hostPacket(int conn, int type, const uint8_t *d, int len)
 		sendRoster();
 		return;
 	}
-	// relay to the other clients, the sender id is set by the host
+	// relay to the other clients, the sender id is set by the host. States go to
+	// the ring neighbours only, unless the alive flag changed. Garbage goes to
+	// its target only.
+	bool wasAlive = players[conn].alive;
+	handleMessage(type, conn, d, len);
+	if (type == MSG_STATE && players[conn].alive == wasAlive)
+	{
+		relayState(conn, d, len);
+		return;
+	}
+	if (type == MSG_GARBAGE && len >= 2)
+	{
+		if (d[0] != conn && d[0] < MAXP && conns[d[0]].fd >= 0)
+			sendPacket(conns[d[0]].fd, type, conn, d, len);
+		return;
+	}
 	for (int i = 1; i < MAXP; i++)
 		if (i != conn && conns[i].fd >= 0)
 			sendPacket(conns[i].fd, type, conn, d, len);
-	handleMessage(type, conn, d, len);
 }
 
 static void dropConn(int i)
@@ -1464,7 +1520,7 @@ static int netHost(int port)
 	a.sin_family = AF_INET;
 	a.sin_addr.s_addr = htonl(INADDR_ANY);
 	a.sin_port = htons(port);
-	if (bind(listenFd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(listenFd, 4) < 0)
+	if (bind(listenFd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(listenFd, 16) < 0)
 	{
 		perror("tetris-together: cannot listen");
 		return -1;
@@ -1753,19 +1809,8 @@ static void render(void)
 	strftime(clk, sizeof(clk), "%H:%M:%S", localtime(&now));
 	text(x0 + tw - 8, y0, clk, C_TITLE, DEF);
 
-	// opponents: with one opponent it is shown on both sides, knocked out players
-	// disappear after KO_MS unless nobody else is left
-	int opp[2] = {-1, -1}, no = 0;
-	for (int pass = 0; pass < 2 && !no; pass++)
-		for (int i = 0; i < MAXP && no < 2; i++)
-		{
-			Player *p = &players[i];
-			bool gone = G.state != ST_LOBBY && p->inRound && !p->alive && t - p->koTime >= KO_MS;
-			if (i != G.myId && p->present && (pass || !gone))
-				opp[no++] = i;
-		}
-	if (no == 1)
-		opp[1] = opp[0];
+	// opponents: the ring neighbours, left sends garbage to us and right receives ours
+	int myIdx = (int)(me - players), opp[2] = {ringView(myIdx, 0, t), ringView(myIdx, 1, t)};
 	drawOpponent(lpx, top, pw, mh, s, opp[0]);
 	drawOpponent(rpx, top, pw, mh, s, opp[1]);
 
@@ -1872,8 +1917,8 @@ static void render(void)
 	graph(rsx + 1, top + 18, sw - 2, mh - 19, me->histPps, me->histLen, gradTemp);
 
 	// dialogs
-	const char *l[10];
-	uint32_t lc[10];
+	const char *l[16];
+	uint32_t lc[16];
 	int n = 0;
 	if (G.status[0])
 	{
@@ -1882,7 +1927,7 @@ static void render(void)
 	}
 	else if (G.state == ST_LOBBY)
 	{
-		char addr[96], names[MAXP][40];
+		char addr[96], names[10][40];
 		l[n] = "LOBBY", lc[n++] = C_TITLE;
 		if (G.mode == MODE_HOST)
 		{
@@ -1890,10 +1935,29 @@ static void render(void)
 			l[n] = "join with -j", lc[n++] = C_LABEL;
 			l[n] = addr, lc[n++] = gradNet[0];
 		}
-		for (int i = 0; i < MAXP; i++)
+		// show 8 players at a time, the arrow keys scroll the list
+		int maxScroll = nIn > 8 ? nIn - 8 : 0;
+		if (G.lobbyScroll > maxScroll)
+			G.lobbyScroll = maxScroll;
+		if (G.lobbyScroll < 0)
+			G.lobbyScroll = 0;
+		if (maxScroll)
 		{
-			snprintf(names[i], sizeof(names[i]), "%d %s", i + 1, players[i].present ? players[i].name : "-");
-			l[n] = names[i], lc[n++] = players[i].present ? (i == G.myId ? gradCpu[0] : C_MAIN) : C_INACTIVE;
+			snprintf(names[8], sizeof(names[8]), G.lobbyScroll ? "↑ %d more" : "", G.lobbyScroll);
+			l[n] = names[8], lc[n++] = C_LABEL;
+		}
+		int shown = 0, skip = G.lobbyScroll;
+		for (int i = 0; i < MAXP && shown < 8; i++)
+			if (players[i].present && skip-- <= 0)
+			{
+				snprintf(names[shown], sizeof(names[shown]), "%d %s", i + 1, players[i].name);
+				l[n] = names[shown++], lc[n++] = i == G.myId ? gradCpu[0] : C_MAIN;
+			}
+		if (maxScroll)
+		{
+			int below = maxScroll - G.lobbyScroll;
+			snprintf(names[9], sizeof(names[9]), below ? "↓ %d more" : "", below);
+			l[n] = names[9], lc[n++] = C_LABEL;
 		}
 		l[n] = G.mode == MODE_HOST ? "enter: start" : "waiting for host", lc[n++] = C_LABEL;
 	}
@@ -2003,6 +2067,11 @@ static void onKey(int k)
 		startRound((uint32_t)time(NULL) ^ (uint32_t)rand());
 		return;
 	}
+	if (G.state == ST_LOBBY && (k == KEY_UP || k == KEY_DOWN))
+	{
+		G.lobbyScroll += k == KEY_UP ? -1 : 1;
+		return;
+	}
 	if (k == 'p' && G.mode == MODE_OFFLINE && G.state == ST_PLAYING)
 		G.paused = !G.paused;
 	if (G.state != ST_PLAYING || G.paused || !me->active)
@@ -2081,7 +2150,7 @@ static void usage(void)
 	printf("  -n, --name NAME        your player name\n");
 	printf("  -b, --bots N           play against 1 or 2 bots\n");
 	printf("  -d, --difficulty D     bot difficulty: easy, normal, hard\n");
-	printf("  -s, --host [PORT]      host a game for up to 3 players (default port %d)\n", DEFAULT_PORT);
+	printf("  -s, --host [PORT]      host a game for up to %d players (default port %d)\n", MAXP, DEFAULT_PORT);
 	printf("  -j, --join HOST[:PORT] join a hosted game\n");
 	printf("  -l, --level N          start level (1-20)\n");
 	printf("      --256              use 256 colors instead of truecolor\n");
@@ -2230,6 +2299,8 @@ int main(int argc, char *argv[])
 
 		double t = nowMs(), dt = t - last;
 		last = t;
+		if (G.mode == MODE_HOST)
+			updateViews(t);
 		if (dt > 100)
 			dt = 100;
 		if (G.state == ST_COUNTDOWN && t - G.stateTime >= COUNT_MS)

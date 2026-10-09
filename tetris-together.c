@@ -2104,13 +2104,20 @@ static void render(void)
 	for (int i = 0; title[i]; i++)
 		put(x0 + i, y0, title[i], i < 6 ? gradient(gradNet, i / 5.0) : C_LABEL, DEF);
 	char mode[64];
-	int nIn = 0;
+	int nIn = 0, nRound = 0, nAlive = 0;
 	for (int i = 0; i < MAXP; i++)
+	{
 		nIn += players[i].present;
+		nRound += players[i].present && players[i].inRound;
+		nAlive += players[i].present && players[i].inRound && players[i].alive;
+	}
+	const char *role = G.mode == MODE_HOST ? "host" : "client";
 	if (G.mode == MODE_OFFLINE)
 		snprintf(mode, sizeof(mode), G.nBots ? "versus %d bot%s" : "marathon", G.nBots, G.nBots > 1 ? "s" : "");
+	else if ((G.state == ST_COUNTDOWN || G.state == ST_PLAYING) && nRound > 0)
+		snprintf(mode, sizeof(mode), "battle · %d/%d left · %s", nAlive, nRound, role);
 	else
-		snprintf(mode, sizeof(mode), "battle · %d player%s · %s", nIn, nIn > 1 ? "s" : "", G.mode == MODE_HOST ? "host" : "client");
+		snprintf(mode, sizeof(mode), "battle · %d player%s · %s", nIn, nIn > 1 ? "s" : "", role);
 	textCenter(x0, y0, tw, mode, C_MAIN);
 	char clk[16];
 	time_t now = time(NULL);
